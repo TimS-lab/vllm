@@ -510,7 +510,16 @@ class Scheduler(SchedulerInterface):
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
             aligned_end = end // block_size * block_size
-            if aligned_end > start or block_size <= max_prefill_tokens:
+            # The `block_size <= max_prefill_tokens` escape (removed) assumed
+            # num_new_tokens is always comfortably large under that config,
+            # but outer token-budget contention under concurrent load can
+            # shrink it far below block_size regardless. In that case
+            # aligned_end collapses to <= start, zeroing (or negating)
+            # end - start below and stranding the whole waiting queue once
+            # `_mamba_block_aligned_split` returns 0 to a bare `break` caller
+            # (vllm-project/vllm#45414, #40707). Only align down when doing
+            # so still leaves real progress.
+            if aligned_end > start:
                 end = aligned_end
 
         next_block_boundary = (start // block_size + 1) * block_size
@@ -1178,7 +1187,15 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens,
                         )
                         if num_new_tokens == 0:
-                            break
+                            # Defense in depth alongside the
+                            # _mamba_block_aligned_split fix above: mirror
+                            # this loop's own skip-and-retry idiom (used for
+                            # every other "can't schedule this one right
+                            # now" reason above) instead of `break`, which
+                            # would strand every other waiting request too
+                            # (vllm-project/vllm#45414, #40707).
+                            skip_request(request_queue)
+                            continue
                         if (
                             pad_spec_decode
                             and num_new_tokens != 1 + self.num_spec_tokens
@@ -1215,8 +1232,12 @@ class Scheduler(SchedulerInterface):
                     )
 
                     if num_new_tokens == 0:
-                        # The request cannot be scheduled.
-                        break
+                        # The request cannot be scheduled. Skip and retry
+                        # next tick rather than `break`, which would strand
+                        # every other waiting request too (same idiom as
+                        # above; vllm-project/vllm#45414, #40707).
+                        skip_request(request_queue)
+                        continue
 
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
